@@ -1,0 +1,1127 @@
+/*
+ * ============================================================================
+ *  SGEO - Sistema de Gerenciamento de Estoque de ONG
+ *  ONG Amor & Esperança
+ * ----------------------------------------------------------------------------
+ *  Sistema de console (CLI) para:
+ *    - Módulo 01: Controle de estoque (US-001 / US-002)
+ *    - Módulo 02: Cadastro de famílias beneficiadas (US-003)
+ *    - Módulo 03: Fluxo financeiro e transparência (US-004 / US-005)
+ *
+ *  Compilação (Windows, com GCC/MinGW-w64):
+ *      gcc -std=c99 -Wall -Wextra -o sgeo.exe sgeo.c
+ *
+ *  Observações de projeto:
+ *    - Os dados ficam em vetores dinâmicos (malloc/realloc) em tempo de execução.
+ *    - Valores em dinheiro são guardados em CENTAVOS (long long) para evitar
+ *      erros de arredondamento de ponto flutuante.
+ *    - Toda entrada do usuário é lida como texto (fgets) e validada, o que
+ *      evita travamentos com dados digitados incorretamente.
+ *    - Salve este arquivo com codificação UTF-8.
+ * ============================================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <math.h>
+#include <setjmp.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+/* ------------------------------ Constantes ------------------------------- */
+
+#define TAM_NOME        60      /* nome de item / identificação de família    */
+#define TAM_CATEGORIA   40
+#define TAM_DESCRICAO   100
+#define TAM_DATA        11      /* "dd/mm/aaaa" + '\0'                        */
+#define TAM_LINHA       256     /* buffer de leitura de linha                 */
+#define QTD_MAX_ITEM    1000000 /* limite de quantidade por item              */
+#define INTEGRANTES_MAX 50      /* limite de integrantes por família          */
+#define CAPACIDADE_INICIAL 8
+
+#define TIPO_ENTRADA 1
+#define TIPO_SAIDA   2
+
+/* -------------------------------- Structs -------------------------------- */
+
+/* Item do estoque (alimentos, roupas, etc.) */
+typedef struct {
+    int  codigo;                 /* código sequencial gerado pelo sistema */
+    char nome[TAM_NOME];
+    char categoria[TAM_CATEGORIA];
+    int  quantidade;
+} ItemEstoque;
+
+/* Família assistida pela ONG */
+typedef struct {
+    int  codigo;                 /* código sequencial gerado pelo sistema */
+    char identificacao[TAM_NOME];/* nome ou código informado pelo usuário */
+    int  integrantes;
+} Familia;
+
+/* Movimentação financeira (entrada ou saída de dinheiro) */
+typedef struct {
+    int       tipo;                    /* TIPO_ENTRADA ou TIPO_SAIDA        */
+    long long valor_centavos;          /* sempre positivo                   */
+    char      data[TAM_DATA];          /* dd/mm/aaaa                        */
+    char      descricao[TAM_DESCRICAO];
+    long long saldo_apos_centavos;     /* saldo logo após esta movimentação */
+} TransacaoFinanceira;
+
+/* Estado completo do sistema (evita variáveis globais) */
+typedef struct {
+    ItemEstoque *itens;
+    size_t       n_itens;
+    size_t       cap_itens;
+    int          proximo_codigo_item;
+
+    Familia     *familias;
+    size_t       n_familias;
+    size_t       cap_familias;
+    int          proximo_codigo_familia;
+
+    TransacaoFinanceira *transacoes;
+    size_t               n_transacoes;
+    size_t               cap_transacoes;
+    long long            saldo_centavos;
+} Sistema;
+
+/* ========================================================================== */
+/*                        FUNÇÕES AUXILIARES DE INTERFACE                     */
+/* ========================================================================== */
+
+/* Limpa a tela do console. */
+static void limpar_tela(void)
+{
+#ifdef _WIN32
+    system("cls");
+#else
+    system("clear");
+#endif
+}
+
+/* Remove espaços (e quebras de linha) do início e do fim de uma string. */
+static void aparar(char *s)
+{
+    size_t ini = 0, fim = strlen(s);
+
+    while (fim > 0 && isspace((unsigned char)s[fim - 1])) {
+        s[--fim] = '\0';
+    }
+    while (s[ini] != '\0' && isspace((unsigned char)s[ini])) {
+        ini++;
+    }
+    if (ini > 0) {
+        memmove(s, s + ini, strlen(s + ini) + 1);
+    }
+}
+
+/*
+ * Mecanismo de cancelamento: enquanto uma operação está em andamento
+ * (g_cancelamento_ativo = 1), digitar "cancelar" em QUALQUER campo
+ * interrompe a operação e volta ao menu (via longjmp).
+ */
+#define PALAVRA_CANCELAR "cancelar"
+static jmp_buf g_ponto_cancelar;
+static int g_cancelamento_ativo = 0;
+
+static int iguais_sem_caixa(const char *a, const char *b);
+
+/*
+ * Lê uma linha do teclado de forma segura.
+ *  - Descarta o excedente se o usuário digitar mais que o buffer comporta.
+ *  - Se a entrada for encerrada (Ctrl+Z / EOF), finaliza o programa com
+ *    segurança, pois não há mais como interagir com o usuário.
+ */
+static void ler_linha(const char *prompt, char *destino, size_t tamanho)
+{
+    printf("%s", prompt);
+    fflush(stdout);
+
+    if (fgets(destino, (int)tamanho, stdin) == NULL) {
+        printf("\nEntrada encerrada. Saindo do sistema...\n");
+        exit(EXIT_SUCCESS);
+    }
+
+    /* Se não houver '\n', a linha era maior que o buffer: descarta o resto */
+    if (strchr(destino, '\n') == NULL) {
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF) {
+            /* descarta */
+        }
+    }
+    aparar(destino);
+
+    /* Cancelamento global: volta ao ponto salvo em executar_operacao() */
+    if (g_cancelamento_ativo && iguais_sem_caixa(destino, PALAVRA_CANCELAR)) {
+        longjmp(g_ponto_cancelar, 1);
+    }
+}
+
+/* Lê um texto obrigatório: repete até que o usuário digite algo não vazio. */
+static void ler_texto_obrigatorio(const char *prompt, char *destino, size_t tamanho)
+{
+    for (;;) {
+        ler_linha(prompt, destino, tamanho);
+        if (destino[0] != '\0') {
+            return;
+        }
+        printf("  [ERRO] Este campo é obrigatório e não pode ficar em branco.\n");
+    }
+}
+
+/* Lê um número inteiro dentro do intervalo [minimo, maximo]. */
+static int ler_inteiro(const char *prompt, int minimo, int maximo)
+{
+    char linha[TAM_LINHA];
+    char *fim;
+    long valor;
+
+    for (;;) {
+        ler_linha(prompt, linha, sizeof(linha));
+
+        if (linha[0] == '\0') {
+            printf("  [ERRO] Este campo é obrigatório e não pode ficar em branco.\n");
+            continue;
+        }
+
+        valor = strtol(linha, &fim, 10);
+        if (*fim != '\0') {
+            printf("  [ERRO] Digite apenas números inteiros (ex.: 10).\n");
+            continue;
+        }
+        if (valor < minimo || valor > maximo) {
+            printf("  [ERRO] Valor fora do permitido. Digite um número de %d a %d.\n",
+                   minimo, maximo);
+            continue;
+        }
+        return (int)valor;
+    }
+}
+
+/*
+ * Lê um valor monetário (aceita vírgula ou ponto como separador decimal)
+ * e devolve o resultado em centavos. Aceita de R$ 0,01 até R$ 1.000.000.000.
+ */
+static long long ler_valor_centavos(const char *prompt)
+{
+    char linha[TAM_LINHA];
+    char *fim;
+    double valor;
+    size_t i;
+
+    for (;;) {
+        ler_linha(prompt, linha, sizeof(linha));
+
+        if (linha[0] == '\0') {
+            printf("  [ERRO] Este campo é obrigatório e não pode ficar em branco.\n");
+            continue;
+        }
+
+        /* Troca vírgula por ponto, para aceitar "12,50" */
+        for (i = 0; linha[i] != '\0'; i++) {
+            if (linha[i] == ',') {
+                linha[i] = '.';
+            }
+        }
+
+        valor = strtod(linha, &fim);
+        if (*fim != '\0') {
+            printf("  [ERRO] Valor inválido. Exemplo de formato: 150,75\n");
+            continue;
+        }
+        /* A comparação negada também rejeita NaN */
+        if (!(valor >= 0.01 && valor <= 1000000000.0)) {
+            printf("  [ERRO] O valor deve ser maior que zero (mínimo R$ 0,01).\n");
+            continue;
+        }
+        return (long long)llround(valor * 100.0);
+    }
+}
+
+/* Retorna 1 se o ano for bissexto. */
+static int ano_bissexto(int ano)
+{
+    return (ano % 4 == 0 && ano % 100 != 0) || (ano % 400 == 0);
+}
+
+/* Retorna 1 se dia/mês/ano formarem uma data real do calendário. */
+static int data_valida(int dia, int mes, int ano)
+{
+    static const int dias_mes[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int limite;
+
+    if (ano < 1900 || ano > 2100 || mes < 1 || mes > 12 || dia < 1) {
+        return 0;
+    }
+    limite = dias_mes[mes - 1];
+    if (mes == 2 && ano_bissexto(ano)) {
+        limite = 29;
+    }
+    return dia <= limite;
+}
+
+/* Lê uma data no formato dd/mm/aaaa e a devolve normalizada em 'destino'. */
+static void ler_data(const char *prompt, char *destino)
+{
+    char linha[TAM_LINHA];
+    int dia, mes, ano, lidos = 0;
+
+    for (;;) {
+        ler_linha(prompt, linha, sizeof(linha));
+
+        if (linha[0] == '\0') {
+            printf("  [ERRO] Este campo é obrigatório e não pode ficar em branco.\n");
+            continue;
+        }
+
+        /* %n confere que não sobraram caracteres após a data */
+        if (sscanf(linha, "%d/%d/%d%n", &dia, &mes, &ano, &lidos) == 3
+            && linha[lidos] == '\0'
+            && data_valida(dia, mes, ano)) {
+            snprintf(destino, TAM_DATA, "%02d/%02d/%04d", dia, mes, ano);
+            return;
+        }
+        printf("  [ERRO] Data inválida. Use o formato dd/mm/aaaa (ex.: 05/11/2026).\n");
+    }
+}
+
+/* Aguarda o usuário pressionar ENTER. */
+static void pausar(void)
+{
+    char lixo[TAM_LINHA];
+    ler_linha("\nPressione ENTER para continuar...", lixo, sizeof(lixo));
+}
+
+/* Compara duas strings ignorando maiúsculas/minúsculas. Retorna 1 se iguais. */
+static int iguais_sem_caixa(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Escreve um valor em centavos como "R$ 1234,56" dentro de 'saida'. */
+static void formatar_dinheiro(char *saida, size_t tamanho, long long centavos)
+{
+    const char *sinal = "";
+    long long absoluto = centavos;
+
+    if (centavos < 0) {
+        sinal = "-";
+        absoluto = -centavos;
+    }
+    snprintf(saida, tamanho, "%sR$ %lld,%02lld", sinal, absoluto / 100, absoluto % 100);
+}
+
+/*
+ * Garante espaço para mais um elemento em um vetor dinâmico.
+ * Devolve o (possivelmente novo) ponteiro, ou NULL se faltar memória.
+ */
+static void *crescer_vetor(void *vetor, size_t *capacidade, size_t quantidade,
+                           size_t tamanho_elemento)
+{
+    size_t nova_cap;
+    void *novo;
+
+    if (quantidade < *capacidade) {
+        return vetor;
+    }
+    nova_cap = (*capacidade == 0) ? CAPACIDADE_INICIAL : (*capacidade * 2);
+    novo = realloc(vetor, nova_cap * tamanho_elemento);
+    if (novo == NULL) {
+        return NULL;
+    }
+    *capacidade = nova_cap;
+    return novo;
+}
+
+/*
+ * Executa uma operação do sistema permitindo cancelá-la a qualquer momento
+ * digitando "cancelar". Ao cancelar, nada é gravado e o menu é retomado.
+ */
+static void executar_operacao(void (*operacao)(Sistema *), Sistema *s)
+{
+    printf("\n(Dica: digite CANCELAR em qualquer campo para desistir da operação.)\n");
+
+    if (setjmp(g_ponto_cancelar) == 0) {
+        g_cancelamento_ativo = 1;
+        operacao(s);
+    } else {
+        printf("\n>> Operação cancelada. Nenhuma alteração foi feita.\n");
+    }
+    g_cancelamento_ativo = 0;
+    pausar();
+}
+
+/* Pede confirmação (1 = sim, 0 = não). Retorna 1 se o usuário confirmar. */
+static int confirmar(const char *pergunta)
+{
+    printf("\n%s\n1 - Sim\n0 - Não\n", pergunta);
+    return ler_inteiro("Escolha: ", 0, 1) == 1;
+}
+
+/* ========================================================================== */
+/*                       MÓDULO 01 - CONTROLE DE ESTOQUE                      */
+/* ========================================================================== */
+
+/* Categorias fixas do estoque ("gavetas"). */
+#define N_CATEGORIAS 3
+static const char *NOMES_CATEGORIA[N_CATEGORIAS] = {"Alimentos", "Roupas", "Higiene"};
+#define OPCAO_GERAL N_CATEGORIAS   /* valor devolvido para "estoque geral" */
+
+/*
+ * Obriga o usuário a escolher uma categoria.
+ * Retorna o índice (0 a N_CATEGORIAS-1), OPCAO_GERAL (se permitido) ou -1 se cancelar.
+ */
+static int escolher_categoria(const char *titulo, int permitir_geral)
+{
+    int i, opcao;
+
+    printf("\n%s\n", titulo);
+    for (i = 0; i < N_CATEGORIAS; i++) {
+        printf("%d - %s\n", i + 1, NOMES_CATEGORIA[i]);
+    }
+    if (permitir_geral) {
+        printf("%d - Estoque geral (todas as categorias)\n", N_CATEGORIAS + 1);
+    }
+    printf("0 - Cancelar\n");
+
+    opcao = ler_inteiro("Escolha: ", 0, permitir_geral ? N_CATEGORIAS + 1 : N_CATEGORIAS);
+    return opcao - 1;   /* 0 vira -1 (cancelar); 1..3 viram 0..2; 4 vira 3 (geral) */
+}
+
+/* Procura um item pelo nome dentro de uma categoria. Retorna índice ou -1. */
+static int localizar_item(const Sistema *s, const char *nome, int categoria)
+{
+    size_t i;
+    for (i = 0; i < s->n_itens; i++) {
+        if (iguais_sem_caixa(s->itens[i].categoria, NOMES_CATEGORIA[categoria])
+            && iguais_sem_caixa(s->itens[i].nome, nome)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Lista os itens de uma categoria e pede o CÓDIGO do item desejado.
+ * Retorna o índice do item, ou -1 se não houver itens, se o usuário
+ * digitar 0 (cancelar) ou se o código não existir na categoria.
+ */
+static int escolher_item_por_codigo(const Sistema *s, int categoria, const char *prompt)
+{
+    size_t i;
+    int qtd = 0, codigo;
+
+    printf("\n--- Itens em %s ---\n", NOMES_CATEGORIA[categoria]);
+    for (i = 0; i < s->n_itens; i++) {
+        if (!iguais_sem_caixa(s->itens[i].categoria, NOMES_CATEGORIA[categoria])) {
+            continue;
+        }
+        if (qtd == 0) {
+            printf("%-5s %-30s %10s\n", "Cód.", "Item", "Quantidade");
+            printf("----- ------------------------------ ----------\n");
+        }
+        qtd++;
+        printf("%-5d %-30.30s %10d\n", s->itens[i].codigo, s->itens[i].nome,
+               s->itens[i].quantidade);
+    }
+    if (qtd == 0) {
+        printf("Nenhum item cadastrado nesta categoria.\n");
+        return -1;
+    }
+
+    codigo = ler_inteiro(prompt, 0, 1000000);
+    if (codigo == 0) {
+        printf("Operação cancelada.\n");
+        return -1;
+    }
+    for (i = 0; i < s->n_itens; i++) {
+        if (s->itens[i].codigo == codigo
+            && iguais_sem_caixa(s->itens[i].categoria, NOMES_CATEGORIA[categoria])) {
+            return (int)i;
+        }
+    }
+    printf("  [ERRO] Código %d não encontrado em %s.\n", codigo, NOMES_CATEGORIA[categoria]);
+    return -1;
+}
+
+/* US-001: exibe o estoque de uma categoria ou o estoque geral. */
+static void visualizar_estoque(Sistema *s)
+{
+    size_t i;
+    int cat, c, n_itens;
+    long long unidades, total_unidades;
+
+    cat = escolher_categoria("Qual parte do estoque deseja visualizar?", 1);
+    if (cat < 0) {
+        printf("Operação cancelada.\n");
+        return;
+    }
+
+    if (cat == OPCAO_GERAL) {
+        printf("\n=== ESTOQUE GERAL ===\n\n");
+    } else {
+        printf("\n=== ESTOQUE: %s ===\n\n", NOMES_CATEGORIA[cat]);
+    }
+
+    n_itens = 0;
+    total_unidades = 0;
+    for (i = 0; i < s->n_itens; i++) {
+        if (cat != OPCAO_GERAL
+            && !iguais_sem_caixa(s->itens[i].categoria, NOMES_CATEGORIA[cat])) {
+            continue;
+        }
+        if (n_itens == 0) {
+            printf("%-5s %-30s %-20s %10s\n", "Cód.", "Item", "Categoria", "Quantidade");
+            printf("----- ------------------------------ -------------------- ----------\n");
+        }
+        n_itens++;
+        printf("%-5d %-30.30s %-20.20s %10d\n", s->itens[i].codigo,
+               s->itens[i].nome, s->itens[i].categoria, s->itens[i].quantidade);
+        total_unidades += s->itens[i].quantidade;
+    }
+
+    if (n_itens == 0) {
+        printf("Nenhum item cadastrado nesta parte do estoque.\n");
+        return;
+    }
+
+    printf("----- ------------------------------ -------------------- ----------\n");
+    printf("Tipos de item: %d | Total de unidades: %lld\n", n_itens, total_unidades);
+
+    /* No estoque geral, mostra também o subtotal de cada categoria */
+    if (cat == OPCAO_GERAL) {
+        printf("\n--- Total por categoria ---\n");
+        for (c = 0; c < N_CATEGORIAS; c++) {
+            unidades = 0;
+            for (i = 0; i < s->n_itens; i++) {
+                if (iguais_sem_caixa(s->itens[i].categoria, NOMES_CATEGORIA[c])) {
+                    unidades += s->itens[i].quantidade;
+                }
+            }
+            printf("%-10s: %lld unidades\n", NOMES_CATEGORIA[c], unidades);
+        }
+    }
+}
+
+/* US-002: cadastra um novo item (ou soma a um item já existente na categoria). */
+static void cadastrar_item(Sistema *s)
+{
+    char nome[TAM_NOME];
+    int cat, quantidade, idx;
+
+    printf("\n=== CADASTRAR ITEM NO ESTOQUE ===\n");
+
+    cat = escolher_categoria("Qual o tipo de suprimento?", 0);
+    if (cat < 0) {
+        printf("Operação cancelada.\n");
+        return;
+    }
+    printf("\nCategoria selecionada: %s\n", NOMES_CATEGORIA[cat]);
+
+    ler_texto_obrigatorio("Nome do item: ", nome, sizeof(nome));
+    idx = localizar_item(s, nome, cat);
+
+    if (idx >= 0) {
+        /* Item já existe nesta categoria: apenas soma a quantidade recebida */
+        printf("O item \"%s\" já existe em %s (quantidade atual: %d).\n",
+               s->itens[idx].nome, s->itens[idx].categoria, s->itens[idx].quantidade);
+        quantidade = ler_inteiro("Quantidade a adicionar: ", 1, QTD_MAX_ITEM);
+
+        if ((long long)s->itens[idx].quantidade + quantidade > QTD_MAX_ITEM) {
+            printf("  [ERRO] A quantidade total ultrapassaria o limite de %d.\n", QTD_MAX_ITEM);
+            return;
+        }
+        s->itens[idx].quantidade += quantidade;
+        printf("\nEstoque atualizado! Nova quantidade de \"%s\": %d\n",
+               s->itens[idx].nome, s->itens[idx].quantidade);
+        return;
+    }
+
+    quantidade = ler_inteiro("Quantidade: ", 1, QTD_MAX_ITEM);
+
+    {
+        ItemEstoque *novo = crescer_vetor(s->itens, &s->cap_itens, s->n_itens, sizeof(ItemEstoque));
+        if (novo == NULL) {
+            printf("  [ERRO] Memória insuficiente para cadastrar o item.\n");
+            return;
+        }
+        s->itens = novo;
+    }
+
+    strncpy(s->itens[s->n_itens].nome, nome, TAM_NOME - 1);
+    s->itens[s->n_itens].nome[TAM_NOME - 1] = '\0';
+    strncpy(s->itens[s->n_itens].categoria, NOMES_CATEGORIA[cat], TAM_CATEGORIA - 1);
+    s->itens[s->n_itens].categoria[TAM_CATEGORIA - 1] = '\0';
+    s->itens[s->n_itens].quantidade = quantidade;
+    s->itens[s->n_itens].codigo = s->proximo_codigo_item++;
+    s->n_itens++;
+
+    printf("\nItem \"%s\" cadastrado em %s com sucesso! (Código %d)\n",
+           nome, NOMES_CATEGORIA[cat], s->itens[s->n_itens - 1].codigo);
+}
+
+/* US-002: atualiza a quantidade de um item existente. */
+static void atualizar_item(Sistema *s)
+{
+    int cat, idx, opcao, qtd;
+
+    printf("\n=== ATUALIZAR QUANTIDADE DE ITEM ===\n");
+
+    if (s->n_itens == 0) {
+        printf("\nNenhum item cadastrado no estoque.\n");
+        return;
+    }
+
+    cat = escolher_categoria("Em qual categoria está o item?", 0);
+    if (cat < 0) {
+        printf("Operação cancelada.\n");
+        return;
+    }
+
+    idx = escolher_item_por_codigo(s, cat, "\nCódigo do item a atualizar (0 = cancelar): ");
+    if (idx < 0) {
+        return;
+    }
+
+    printf("Item: %s | Categoria: %s | Quantidade atual: %d\n\n",
+           s->itens[idx].nome, s->itens[idx].categoria, s->itens[idx].quantidade);
+    printf("1 - Adicionar unidades (entrada / doação recebida)\n");
+    printf("2 - Retirar unidades (saída / distribuição)\n");
+    printf("3 - Definir nova quantidade (ajuste de inventário)\n");
+    printf("0 - Cancelar\n");
+    opcao = ler_inteiro("Escolha: ", 0, 3);
+
+    switch (opcao) {
+    case 1:
+        qtd = ler_inteiro("Quantidade a adicionar: ", 1, QTD_MAX_ITEM);
+        if ((long long)s->itens[idx].quantidade + qtd > QTD_MAX_ITEM) {
+            printf("  [ERRO] A quantidade total ultrapassaria o limite de %d.\n", QTD_MAX_ITEM);
+            return;
+        }
+        s->itens[idx].quantidade += qtd;
+        break;
+    case 2:
+        qtd = ler_inteiro("Quantidade a retirar: ", 1, QTD_MAX_ITEM);
+        if (qtd > s->itens[idx].quantidade) {
+            printf("  [ERRO] Estoque insuficiente. Disponível: %d\n", s->itens[idx].quantidade);
+            return;
+        }
+        s->itens[idx].quantidade -= qtd;
+        break;
+    case 3:
+        s->itens[idx].quantidade = ler_inteiro("Nova quantidade: ", 0, QTD_MAX_ITEM);
+        break;
+    default:
+        printf("Operação cancelada.\n");
+        return;
+    }
+    printf("\nEstoque atualizado! Quantidade de \"%s\": %d\n",
+           s->itens[idx].nome, s->itens[idx].quantidade);
+}
+
+/* Exclui um item do estoque (com confirmação). */
+static void excluir_item(Sistema *s)
+{
+    int cat, idx;
+
+    printf("\n=== EXCLUIR ITEM DO ESTOQUE ===\n");
+
+    if (s->n_itens == 0) {
+        printf("\nNenhum item cadastrado no estoque.\n");
+        return;
+    }
+
+    cat = escolher_categoria("Em qual categoria está o item?", 0);
+    if (cat < 0) {
+        printf("Operação cancelada.\n");
+        return;
+    }
+
+    idx = escolher_item_por_codigo(s, cat, "\nCódigo do item a excluir (0 = cancelar): ");
+    if (idx < 0) {
+        return;
+    }
+
+    printf("\nItem: %s | Categoria: %s | Quantidade: %d\n",
+           s->itens[idx].nome, s->itens[idx].categoria, s->itens[idx].quantidade);
+    if (!confirmar("Tem certeza que deseja EXCLUIR este item?")) {
+        printf("Exclusão cancelada.\n");
+        return;
+    }
+
+    /* Desloca os itens seguintes uma posição para trás */
+    memmove(&s->itens[idx], &s->itens[idx + 1],
+            (s->n_itens - (size_t)idx - 1) * sizeof(ItemEstoque));
+    s->n_itens--;
+    printf("\nItem excluído com sucesso!\n");
+}
+
+/* Menu do Módulo 01. */
+static void menu_estoque(Sistema *s)
+{
+    int opcao;
+
+    do {
+        limpar_tela();
+        printf("==========================================\n");
+        printf("   MÓDULO 01 - CONTROLE DE ESTOQUE\n");
+        printf("==========================================\n");
+        printf("1 - Visualizar estoque\n");
+        printf("2 - Cadastrar novo item\n");
+        printf("3 - Atualizar quantidade de item existente\n");
+        printf("4 - Excluir item\n");
+        printf("0 - Voltar ao menu principal\n");
+        printf("------------------------------------------\n");
+        opcao = ler_inteiro("Escolha uma opção: ", 0, 4);
+
+        switch (opcao) {
+        case 1: executar_operacao(visualizar_estoque, s); break;
+        case 2: executar_operacao(cadastrar_item, s);     break;
+        case 3: executar_operacao(atualizar_item, s);     break;
+        case 4: executar_operacao(excluir_item, s);       break;
+        default: break;
+        }
+    } while (opcao != 0);
+}
+
+/* ========================================================================== */
+/*                  MÓDULO 02 - FAMÍLIAS BENEFICIADAS (US-003)                */
+/* ========================================================================== */
+
+/* Calcula e exibe as métricas estatísticas das famílias. */
+static void exibir_estatisticas_familias(const Sistema *s)
+{
+    size_t i;
+    long long total_integrantes = 0;
+
+    for (i = 0; i < s->n_familias; i++) {
+        total_integrantes += s->familias[i].integrantes;
+    }
+
+    printf("\n--- Métricas de acompanhamento ---\n");
+    printf("Total de famílias cadastradas : %zu\n", s->n_familias);
+    printf("Total de pessoas assistidas   : %lld\n", total_integrantes);
+    if (s->n_familias > 0) {
+        printf("Média de integrantes/família  : %.2f\n",
+               (double)total_integrantes / (double)s->n_familias);
+    }
+}
+
+/* Lista todas as famílias cadastradas. */
+static void listar_familias(Sistema *s)
+{
+    size_t i;
+
+    printf("\n=== FAMÍLIAS CADASTRADAS ===\n\n");
+
+    if (s->n_familias == 0) {
+        printf("Nenhuma família cadastrada.\n");
+        return;
+    }
+
+    printf("%-8s %-40s %12s\n", "Código", "Identificação", "Integrantes");
+    printf("-------- ---------------------------------------- ------------\n");
+    for (i = 0; i < s->n_familias; i++) {
+        printf("%-8d %-40.40s %12d\n", s->familias[i].codigo,
+               s->familias[i].identificacao, s->familias[i].integrantes);
+    }
+    exibir_estatisticas_familias(s);
+}
+
+/* US-003: cadastra uma nova família assistida. */
+static void cadastrar_familia(Sistema *s)
+{
+    char identificacao[TAM_NOME];
+    int integrantes;
+    size_t i;
+
+    printf("\n=== CADASTRAR FAMÍLIA BENEFICIADA ===\n\n");
+
+    ler_texto_obrigatorio("Identificação da família (código ou nome): ", identificacao,
+                          sizeof(identificacao));
+
+    /* Evita cadastrar duas vezes a mesma família */
+    for (i = 0; i < s->n_familias; i++) {
+        if (iguais_sem_caixa(s->familias[i].identificacao, identificacao)) {
+            printf("  [ERRO] Já existe uma família cadastrada com a identificação \"%s\".\n",
+                   identificacao);
+            return;
+        }
+    }
+
+    integrantes = ler_inteiro("Quantidade de integrantes: ", 1, INTEGRANTES_MAX);
+
+    {
+        Familia *nova = crescer_vetor(s->familias, &s->cap_familias, s->n_familias, sizeof(Familia));
+        if (nova == NULL) {
+            printf("  [ERRO] Memória insuficiente para cadastrar a família.\n");
+            return;
+        }
+        s->familias = nova;
+    }
+
+    s->familias[s->n_familias].codigo = s->proximo_codigo_familia++;
+    strncpy(s->familias[s->n_familias].identificacao, identificacao, TAM_NOME - 1);
+    s->familias[s->n_familias].identificacao[TAM_NOME - 1] = '\0';
+    s->familias[s->n_familias].integrantes = integrantes;
+    s->n_familias++;
+
+    printf("\nFamília \"%s\" cadastrada com sucesso! (Código %d)\n",
+           identificacao, s->familias[s->n_familias - 1].codigo);
+    exibir_estatisticas_familias(s);
+}
+
+/* Procura uma família pelo código. Retorna índice ou -1. */
+static int localizar_familia_por_codigo(const Sistema *s, int codigo)
+{
+    size_t i;
+    for (i = 0; i < s->n_familias; i++) {
+        if (s->familias[i].codigo == codigo) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Edita identificação e/ou quantidade de integrantes de uma família. */
+static void editar_familia(Sistema *s)
+{
+    char nova_id[TAM_NOME];
+    int codigo, idx, opcao, ok;
+    size_t i;
+    Familia *f;
+
+    printf("\n=== EDITAR FAMÍLIA ===\n");
+
+    if (s->n_familias == 0) {
+        printf("\nNenhuma família cadastrada.\n");
+        return;
+    }
+
+    /* Mostra a lista resumida para o usuário escolher o código */
+    printf("\n%-8s %-40s %12s\n", "Código", "Identificação", "Integrantes");
+    for (i = 0; i < s->n_familias; i++) {
+        printf("%-8d %-40.40s %12d\n", s->familias[i].codigo,
+               s->familias[i].identificacao, s->familias[i].integrantes);
+    }
+
+    codigo = ler_inteiro("\nCódigo da família a editar (0 = cancelar): ", 0, 1000000);
+    if (codigo == 0) {
+        printf("Operação cancelada.\n");
+        return;
+    }
+    idx = localizar_familia_por_codigo(s, codigo);
+    if (idx < 0) {
+        printf("  [ERRO] Família com código %d não encontrada.\n", codigo);
+        return;
+    }
+    f = &s->familias[idx];
+
+    printf("\nFamília selecionada: %s (%d integrantes)\n\n", f->identificacao, f->integrantes);
+    printf("1 - Alterar identificação (código/nome)\n");
+    printf("2 - Alterar quantidade de integrantes\n");
+    printf("3 - Alterar os dois\n");
+    printf("0 - Cancelar\n");
+    opcao = ler_inteiro("Escolha: ", 0, 3);
+    if (opcao == 0) {
+        printf("Operação cancelada.\n");
+        return;
+    }
+
+    /* Altera a identificação (opções 1 e 3) */
+    if (opcao == 1 || opcao == 3) {
+        do {
+            ok = 1;
+            ler_texto_obrigatorio("Nova identificação: ", nova_id, sizeof(nova_id));
+            for (i = 0; i < s->n_familias; i++) {
+                if ((int)i != idx && iguais_sem_caixa(s->familias[i].identificacao, nova_id)) {
+                    printf("  [ERRO] Já existe outra família com a identificação \"%s\".\n", nova_id);
+                    ok = 0;
+                    break;
+                }
+            }
+        } while (!ok);
+        strncpy(f->identificacao, nova_id, TAM_NOME - 1);
+        f->identificacao[TAM_NOME - 1] = '\0';
+    }
+
+    /* Altera a quantidade de integrantes (opções 2 e 3) */
+    if (opcao == 2 || opcao == 3) {
+        f->integrantes = ler_inteiro("Nova quantidade de integrantes: ", 1, INTEGRANTES_MAX);
+    }
+
+    printf("\nFamília atualizada: %s (%d integrantes)\n", f->identificacao, f->integrantes);
+    exibir_estatisticas_familias(s);
+}
+
+/* Exclui uma família cadastrada (com confirmação). */
+static void excluir_familia(Sistema *s)
+{
+    int codigo, idx;
+    size_t i;
+
+    printf("\n=== EXCLUIR FAMÍLIA ===\n");
+
+    if (s->n_familias == 0) {
+        printf("\nNenhuma família cadastrada.\n");
+        return;
+    }
+
+    printf("\n%-8s %-40s %12s\n", "Código", "Identificação", "Integrantes");
+    for (i = 0; i < s->n_familias; i++) {
+        printf("%-8d %-40.40s %12d\n", s->familias[i].codigo,
+               s->familias[i].identificacao, s->familias[i].integrantes);
+    }
+
+    codigo = ler_inteiro("\nCódigo da família a excluir (0 = cancelar): ", 0, 1000000);
+    if (codigo == 0) {
+        printf("Operação cancelada.\n");
+        return;
+    }
+    idx = localizar_familia_por_codigo(s, codigo);
+    if (idx < 0) {
+        printf("  [ERRO] Família com código %d não encontrada.\n", codigo);
+        return;
+    }
+
+    printf("\nFamília: %s (%d integrantes)\n",
+           s->familias[idx].identificacao, s->familias[idx].integrantes);
+    if (!confirmar("Tem certeza que deseja EXCLUIR esta família?")) {
+        printf("Exclusão cancelada.\n");
+        return;
+    }
+
+    memmove(&s->familias[idx], &s->familias[idx + 1],
+            (s->n_familias - (size_t)idx - 1) * sizeof(Familia));
+    s->n_familias--;
+    printf("\nFamília excluída com sucesso!\n");
+    exibir_estatisticas_familias(s);
+}
+
+/* Menu do Módulo 02. */
+static void menu_familias(Sistema *s)
+{
+    int opcao;
+
+    do {
+        limpar_tela();
+        printf("==========================================\n");
+        printf("   MÓDULO 02 - FAMÍLIAS BENEFICIADAS\n");
+        printf("==========================================\n");
+        printf("1 - Cadastrar nova família\n");
+        printf("2 - Listar famílias e métricas\n");
+        printf("3 - Editar família\n");
+        printf("4 - Excluir família\n");
+        printf("0 - Voltar ao menu principal\n");
+        printf("------------------------------------------\n");
+        opcao = ler_inteiro("Escolha uma opção: ", 0, 4);
+
+        switch (opcao) {
+        case 1: executar_operacao(cadastrar_familia, s); break;
+        case 2: executar_operacao(listar_familias, s);   break;
+        case 3: executar_operacao(editar_familia, s);    break;
+        case 4: executar_operacao(excluir_familia, s);   break;
+        default: break;
+        }
+    } while (opcao != 0);
+}
+
+/* ========================================================================== */
+/*               MÓDULO 03 - FLUXO FINANCEIRO (US-004 / US-005)               */
+/* ========================================================================== */
+
+/* US-004: registra uma entrada ou saída e atualiza o saldo automaticamente. */
+static void registrar_movimentacao(Sistema *s, int tipo)
+{
+    long long valor;
+    char data[TAM_DATA];
+    char descricao[TAM_DESCRICAO];
+    char buf[40];
+    TransacaoFinanceira *t;
+
+    printf("\n=== REGISTRAR %s ===\n\n", tipo == TIPO_ENTRADA ? "ENTRADA (DOAÇÃO/RECEITA)" : "SAÍDA (DESPESA)");
+
+    formatar_dinheiro(buf, sizeof(buf), s->saldo_centavos);
+    printf("Saldo atual: %s\n\n", buf);
+
+    valor = ler_valor_centavos("Valor (R$): ");
+
+    /* A ONG não pode gastar mais do que possui em caixa */
+    if (tipo == TIPO_SAIDA && valor > s->saldo_centavos) {
+        printf("  [ERRO] Saldo insuficiente para esta saída. Operação cancelada.\n");
+        return;
+    }
+
+    ler_data("Data (dd/mm/aaaa): ", data);
+    ler_texto_obrigatorio("Descrição/finalidade: ", descricao, sizeof(descricao));
+
+    {
+        TransacaoFinanceira *nova = crescer_vetor(s->transacoes, &s->cap_transacoes,
+                                                  s->n_transacoes, sizeof(TransacaoFinanceira));
+        if (nova == NULL) {
+            printf("  [ERRO] Memória insuficiente para registrar a movimentação.\n");
+            return;
+        }
+        s->transacoes = nova;
+    }
+
+    /* US-005: atualização automática do saldo */
+    s->saldo_centavos += (tipo == TIPO_ENTRADA) ? valor : -valor;
+
+    t = &s->transacoes[s->n_transacoes++];
+    t->tipo = tipo;
+    t->valor_centavos = valor;
+    strncpy(t->data, data, TAM_DATA - 1);
+    t->data[TAM_DATA - 1] = '\0';
+    strncpy(t->descricao, descricao, TAM_DESCRICAO - 1);
+    t->descricao[TAM_DESCRICAO - 1] = '\0';
+    t->saldo_apos_centavos = s->saldo_centavos;
+
+    formatar_dinheiro(buf, sizeof(buf), s->saldo_centavos);
+    printf("\nMovimentação registrada com sucesso! Novo saldo: %s\n", buf);
+}
+
+/* Atalhos com a assinatura exigida por executar_operacao(). */
+static void registrar_entrada(Sistema *s) { registrar_movimentacao(s, TIPO_ENTRADA); }
+static void registrar_saida(Sistema *s)   { registrar_movimentacao(s, TIPO_SAIDA); }
+
+/* Exibe apenas o saldo atual. */
+static void consultar_saldo(Sistema *s)
+{
+    char buf[40];
+    formatar_dinheiro(buf, sizeof(buf), s->saldo_centavos);
+    printf("\n=== SALDO ATUAL ===\n\nSaldo disponível: %s\n", buf);
+}
+
+/* US-005: histórico completo para prestação de contas aos doadores. */
+static void exibir_historico(Sistema *s)
+{
+    size_t i;
+    long long total_entradas = 0, total_saidas = 0;
+    char v[40], sd[40];
+
+    printf("\n=== HISTÓRICO FINANCEIRO (PRESTAÇÃO DE CONTAS) ===\n\n");
+
+    if (s->n_transacoes == 0) {
+        printf("Nenhuma movimentação registrada.\n");
+        formatar_dinheiro(sd, sizeof(sd), s->saldo_centavos);
+        printf("Saldo atual: %s\n", sd);
+        return;
+    }
+
+    printf("%-4s %-10s %-8s %15s %15s  %s\n", "Nº", "Data", "Tipo", "Valor", "Saldo", "Descrição");
+    printf("---- ---------- -------- --------------- ---------------  ------------------\n");
+    for (i = 0; i < s->n_transacoes; i++) {
+        const TransacaoFinanceira *t = &s->transacoes[i];
+
+        formatar_dinheiro(v, sizeof(v), t->valor_centavos);
+        formatar_dinheiro(sd, sizeof(sd), t->saldo_apos_centavos);
+        printf("%-4zu %-10s %-8s %15s %15s  %s\n", i + 1, t->data,
+               t->tipo == TIPO_ENTRADA ? "ENTRADA" : "SAÍDA", v, sd, t->descricao);
+
+        if (t->tipo == TIPO_ENTRADA) {
+            total_entradas += t->valor_centavos;
+        } else {
+            total_saidas += t->valor_centavos;
+        }
+    }
+    printf("---- ---------- -------- --------------- ---------------  ------------------\n");
+
+    formatar_dinheiro(v, sizeof(v), total_entradas);
+    printf("Total de entradas: %s\n", v);
+    formatar_dinheiro(v, sizeof(v), total_saidas);
+    printf("Total de saídas  : %s\n", v);
+    formatar_dinheiro(v, sizeof(v), s->saldo_centavos);
+    printf("SALDO ATUAL      : %s\n", v);
+}
+
+/* Menu do Módulo 03. */
+static void menu_financeiro(Sistema *s)
+{
+    int opcao;
+
+    do {
+        limpar_tela();
+        printf("==========================================\n");
+        printf("   MÓDULO 03 - FLUXO FINANCEIRO\n");
+        printf("==========================================\n");
+        printf("1 - Registrar entrada de dinheiro\n");
+        printf("2 - Registrar saída de dinheiro\n");
+        printf("3 - Consultar saldo atual\n");
+        printf("4 - Ver histórico (prestação de contas)\n");
+        printf("0 - Voltar ao menu principal\n");
+        printf("------------------------------------------\n");
+        opcao = ler_inteiro("Escolha uma opção: ", 0, 4);
+
+        switch (opcao) {
+        case 1: executar_operacao(registrar_entrada, s); break;
+        case 2: executar_operacao(registrar_saida, s);   break;
+        case 3: executar_operacao(consultar_saldo, s);   break;
+        case 4: executar_operacao(exibir_historico, s);  break;
+        default: break;
+        }
+    } while (opcao != 0);
+}
+
+/* ========================================================================== */
+/*                              MENU PRINCIPAL                                */
+/* ========================================================================== */
+
+int main(void)
+{
+    Sistema sistema;
+    int opcao;
+
+#ifdef _WIN32
+    /* Ajusta o console do Windows para UTF-8 (acentos corretos) */
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
+    /* Inicializa o estado do sistema (tudo zerado, sem dados) */
+    memset(&sistema, 0, sizeof(sistema));
+    sistema.proximo_codigo_familia = 1;
+    sistema.proximo_codigo_item = 1;
+
+    do {
+        limpar_tela();
+        printf("==========================================\n");
+        printf("  SGEO - Sistema de Gerenciamento de\n");
+        printf("         Estoque de ONG\n");
+        printf("         ONG Amor & Esperança\n");
+        printf("==========================================\n");
+        printf("1 - Controle de Estoque\n");
+        printf("2 - Famílias Beneficiadas\n");
+        printf("3 - Fluxo Financeiro\n");
+        printf("0 - Sair\n");
+        printf("------------------------------------------\n");
+        opcao = ler_inteiro("Escolha uma opção: ", 0, 3);
+
+        switch (opcao) {
+        case 1: menu_estoque(&sistema);    break;
+        case 2: menu_familias(&sistema);   break;
+        case 3: menu_financeiro(&sistema); break;
+        default: break;
+        }
+    } while (opcao != 0);
+
+    /* Libera toda a memória alocada dinamicamente */
+    free(sistema.itens);
+    free(sistema.familias);
+    free(sistema.transacoes);
+
+    printf("\nObrigado por usar o SGEO. Até logo!\n");
+    return EXIT_SUCCESS;
+}
